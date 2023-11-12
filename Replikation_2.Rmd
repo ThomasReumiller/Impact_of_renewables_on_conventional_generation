@@ -1,0 +1,1447 @@
+---
+title: "Replikation Teil_2"
+author: "Thomas Reumiller"
+date: "16 10 2023"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+library(haven)
+library(dplyr)
+library(ggplot2)
+library(fixest)
+library(sandwich) # für NeweyWest
+library(AER)
+library(stats)
+```
+
+
+Daten einlesen
+```{r}
+data = read_dta('Setting_Sun_dataset.dta')
+
+data = data %>% 
+  mutate(season = case_when(
+     month <= 2 | month >= 12 ~ 1,    
+     month >= 3 & month <= 5 ~ 2,
+     month >= 6 & month <= 8 ~ 3,
+     month >= 9 & month <= 11 ~ 4
+  ))
+
+
+#unnütz?
+data <- data %>%
+  arrange(hour) %>%
+  mutate(id = row_number())
+
+```
+
+Counterfaktische RTM Preise
+
+```{r}
+
+#erzeuge kontrafaktische Daten
+
+dat = mutate(data,
+  solar_cap_factor = solar_potential / (24 * solar_cap / 1000),
+  wind_cap_factor = wind_potential / (24 * wind_cap / 1000))
+
+for (m in 1:12) {
+  dat = dat %>% 
+  mutate(!!paste("m_", toString(m), sep = "") := ifelse(month == m, 1, 0))
+}
+for (h in 1:24) {
+  dat = dat %>% 
+    mutate(!!paste("daily_solar_h", toString(h), sep = "") := ifelse(hour == h, daily_solar, 0),
+           !!paste("daily_wind_h", toString(h), sep = "") := ifelse(hour == h, daily_wind, 0),
+           !!paste("spot_h", toString(h), sep = "") := ifelse(hour == h, spot, 0),
+           !!paste("inches_lag_h", toString(h), sep = "") := ifelse(hour == h, inches_lag, 0),
+           !!paste("load_h", toString(h), sep = "") := ifelse(hour == h, load, 0),
+           !!paste("h_", toString(h), sep = "") := ifelse(hour == h, 1, 0))
+  for (m in 1:12) {
+    dat = dat %>% 
+    mutate(!!paste(paste("m", toString(m), sep = ""),paste("h", toString(h), sep = ""), sep = "_") := ifelse(month == m & hour == h, 1, 0))
+  }
+}
+```
+
+```{r}
+
+dat_actual = dat
+dat_actual$solar_sample = "actual"
+
+dat_2k = dat
+dat_2k$solar_potential = dat$solar_cap_factor * 2000 * (24 / 1000)
+dat_2k$solar_sample = "solar_2k"
+
+dat_6k = dat
+dat_6k$solar_potential = dat$solar_cap_factor * 6000 * (24 / 1000)
+dat_6k$solar_sample = "solar_6k"
+
+dat_10k = dat
+dat_10k$solar_potential = dat$solar_cap_factor * 10000 * (24 / 1000)
+dat_10k$solar_sample = "solar_10k"
+
+dat_all = rbind(dat_actual, dat_2k, dat_6k, dat_10k)
+
+#Berechne kontrafaktisches courtailment
+
+dat_all$solar_load = dat_all$solar_potential * dat_all$daily_load
+
+formel_m = paste("m_", 1:11, sep = "", collapse = " + ")
+formel = formula(paste("solar_curtailed ~ solar_potential + solar_load + daily_wind + spot + daily_load + inches_lag +", formel_m))
+
+fit = tobit(formel, left = 0, data = filter(dat_all, hour == 12 & solar_sample == "actual"))
+#Ergebnisse passen aber n ist um 20 zu gering (1107 statt 1127)
+
+dat_all$solar_curtailed_fitted = NA
+dat_all$solar_curtailed_fitted =  predict(fit, newdata = dat_all)
+dat_all$solar_curtailed_fitted[dat_all$solar_curtailed_fitted < 0] = 0
+
+dat_all = mutate(dat_all, daily_solar = ifelse(solar_sample != "actual", solar_potential - solar_curtailed_fitted, daily_solar))
+
+for (h in 1:24) {
+ dat_all = mutate(dat_all, !!paste("daily_solar_h", toString(h), sep = "") := case_when(
+   (hour == h) ~ daily_solar,
+   .default = 0
+ ))
+}
+
+
+#berechne kontrafaktische Preise
+
+formel_solar = paste("daily_solar_h", 1:24, sep = "", collapse = " + ")
+formel_wind = paste("daily_wind_h", 1:24, sep = "", collapse = " + ")
+formel_spot = paste("spot_h", 1:24, sep = "", collapse = " + ")
+formel_inches_lag = paste("inches_lag_h", 1:24, sep = "", collapse = " + ")
+formel_load = paste("load_h", 1:24, sep = "", collapse = " + ")
+formel_hour = paste("h_", 1:24, sep = "", collapse = " + ")
+
+formel_rhs = paste(formel_solar,formel_wind,formel_spot,formel_inches_lag,formel_load, formel_hour,"inches_lag_h1", sep = " + ")
+formel = paste("rtm_total_lmp ~ ", formel_rhs)
+
+dat_all <- dat_all %>%
+  mutate(rtm_fitted = NA,
+         resid = NA)
+
+dat_a15 = data.frame(
+  "hour" = 1:24,
+  "beta_solar_winter" = NA,
+  "beta_solar_std_winter" = NA,
+  "beta_solar_spring" = NA,
+  "beta_solar_std_spring" = NA,
+  "beta_solar_summer" = NA,
+  "beta_solar_std_summer" = NA,
+  "beta_solar_fall" = NA,
+  "beta_solar_std_fall" = NA
+)
+
+dat_a16 = data.frame(
+  "hour" = 1:24,
+  "beta_wind_winter" = NA,
+  "beta_wind_std_winter" = NA,
+  "beta_wind_spring" = NA,
+  "beta_wind_std_spring" = NA,
+  "beta_wind_summer" = NA,
+  "beta_wind_std_summer" = NA,
+  "beta_wind_fall" = NA,
+  "beta_wind_std_fall" = NA
+)
+
+for (s in 1:4) {
+  
+  fit = lm(formel,data = filter(dat_all, solar_sample == "actual" & season == s)) 
+  
+  nw = NeweyWest(fit, lag = 7, prewhite = FALSE)
+  nw_error = sqrt(diag(nw))
+  
+  dat_a15[,s*2] = coef(fit)[2:25]
+  dat_a15[,s*2+1] = nw_error[2:25]
+  
+  dat_a16[,s*2] = coef(fit)[26:49]
+  dat_a16[,s*2+1] = nw_error[26:49]
+  
+  dat_all[dat_all$season == s,]$rtm_fitted = predict(fit, newdata = filter(dat_all, season == s))
+  #Warnungen zu rank-deficient fit (ich glaub wegen hour, versuche mit as factor hour)
+  dat_all[dat_all$season == s & dat_all$solar_sample == "actual" & !is.na(dat_all$rtm_total_lmp),]$resid = residuals(fit)
+}
+
+dat_all[dat_all$solar_sample == "solar_2k",]$resid = dat_all[dat_all$solar_sample == "actual",]$resid
+dat_all[dat_all$solar_sample == "solar_6k",]$resid = dat_all[dat_all$solar_sample == "actual",]$resid
+dat_all[dat_all$solar_sample == "solar_10k",]$resid = dat_all[dat_all$solar_sample == "actual",]$resid
+
+dat_all_2016 = dat_all %>%
+  mutate(rtm_hat = rtm_fitted + resid) %>%
+  filter(year == 2016)
+
+#berechne koeffizienten
+
+formel = paste("rtm_hat ~ ", formel_hour, "+ 0")
+beta_actual = coef(lm(formel, data = filter(dat_all_2016, solar_sample == "actual")))
+beta_2k = coef(lm(formel, data = filter(dat_all_2016, solar_sample == "solar_2k")))
+beta_6k = coef(lm(formel, data = filter(dat_all_2016, solar_sample == "solar_6k")))
+beta_10k = coef(lm(formel, data = filter(dat_all_2016, solar_sample == "solar_10k")))
+
+avg_price_solar <- data.frame(
+  hour = 1:24,
+  actual = beta_actual,
+  solar_2k = beta_2k,
+  solar_6k = beta_6k,
+  solar_10k = beta_10k)
+
+rownames(avg_price_solar) = NULL
+
+avg_price_solar
+
+#Actual passt rest leicht nicht liegts an den residuals?? NÖ
+```
+
+Top panel of figure 6 and A7
+```{r}
+dotsize = 2
+linesize = 0.5
+color = c("blue","red","green","black")
+yscale_max = 60
+yscale_min = 0
+step = 10
+
+figure6 =  ggplot(avg_price_solar, aes(x = hour)) +
+  geom_point(aes(y = actual),color = color[1], size = dotsize) +
+  geom_line(aes(y = actual),color = color[1], size = linesize)+
+  geom_point(aes(y = solar_2k ),color = color[2], size = dotsize) +
+  geom_line(aes(y = solar_2k ),color = color[2], size = linesize)+
+  geom_point(aes(y = solar_6k ),color = color[3], size = dotsize) +
+  geom_line(aes(y = solar_6k ),color = color[3], size = linesize)+
+  geom_point(aes(y = solar_10k),color = color[4], size = dotsize) +
+  geom_line(aes(y = solar_10k),color = color[4], size = linesize)+
+  geom_hline(yintercept = 0, color = "black", size = 1.2, linetype = "solid")+
+  labs(x = "Hour", y = expression(paste("Avg. Change in Hourly Generation (MWh)"))) +
+  scale_x_continuous(limits = c(1,24), breaks = 1:24) +
+  scale_y_continuous(limits = c(yscale_min,yscale_max), breaks = seq(yscale_min,yscale_max,step)) +
+  theme_classic() +
+  theme(plot.title = element_text(size = 20, face = "bold"),
+        plot.subtitle = element_text(size = 16, face = "bold"),
+        axis.title = element_text(size = 14),
+        axis.text = element_text(size = 12),
+        legend.position = "none",
+        panel.grid.major.y = element_line(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(fill = "white"),
+        plot.margin = margin(0, 0, 0, 1, "cm"))
+
+
+figure6
+```
+
+
+figure a15 
+```{r}
+yscale_max = 0.6
+yscale_min =-1.4
+step = 0.2
+
+figure_a15a = ggplot(dat_a15, aes(x = hour)) +
+  geom_point(aes(y = beta_solar_winter),color = "grey", size = 3) +
+  geom_errorbar(aes(ymax = beta_solar_winter+2*beta_solar_std_winter, ymin = beta_solar_winter-2*beta_solar_std_winter), size = 0.5) +
+  geom_hline(yintercept = 0, color = "black", size = 1.2, linetype = "solid")+
+  labs(x = "Hour", y = expression(paste("Change in Prices ($/MWh)"))) +
+  scale_x_continuous(limits = c(1,24), breaks = 1:24) +
+  scale_y_continuous(limits = c(yscale_min,yscale_max), breaks = seq(yscale_min,yscale_max,step)) +
+  theme_classic() +
+  theme(plot.title = element_text(size = 20, face = "bold"),
+        plot.subtitle = element_text(size = 16, face = "bold"),
+        axis.title = element_text(size = 14),
+        axis.text = element_text(size = 12),
+        legend.position = "none",
+        panel.grid.major.y = element_line(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(fill = "white"),
+        plot.margin = margin(0, 0, 0, 1, "cm"))
+
+yscale_max = 1
+yscale_min =-1.5
+step = 0.5
+
+figure_a15b = ggplot(dat_a15, aes(x = hour)) +
+  geom_point(aes(y = beta_solar_spring),color = "grey", size = 3) +
+  geom_errorbar(aes(ymax = beta_solar_spring+2*beta_solar_std_spring, ymin = beta_solar_spring-2*beta_solar_std_spring), size = 0.5) +
+  geom_hline(yintercept = 0, color = "black", size = 1.2, linetype = "solid")+
+  labs(x = "Hour", y = expression(paste("Change in Prices ($/MWh)"))) +
+  scale_x_continuous(limits = c(1,24), breaks = 1:24) +
+  scale_y_continuous(limits = c(yscale_min,yscale_max), breaks = seq(yscale_min,yscale_max,step)) +
+  theme_classic() +
+  theme(plot.title = element_text(size = 20, face = "bold"),
+        plot.subtitle = element_text(size = 16, face = "bold"),
+        axis.title = element_text(size = 14),
+        axis.text = element_text(size = 12),
+        legend.position = "none",
+        panel.grid.major.y = element_line(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(fill = "white"),
+        plot.margin = margin(0, 0, 0, 1, "cm"))
+
+yscale_max = 1.2
+yscale_min =-0.8
+step = 0.4
+
+figure_a15c = ggplot(dat_a15, aes(x = hour)) +
+  geom_point(aes(y = beta_solar_summer),color = "grey", size = 3) +
+  geom_errorbar(aes(ymax = beta_solar_summer+2*beta_solar_std_summer, ymin = beta_solar_summer-2*beta_solar_std_summer), size = 0.5) +
+  geom_hline(yintercept = 0, color = "black", size = 1.2, linetype = "solid")+
+  labs(x = "Hour", y = expression(paste("Change in Prices ($/MWh)"))) +
+  scale_x_continuous(limits = c(1,24), breaks = 1:24) +
+  scale_y_continuous(limits = c(yscale_min,yscale_max), breaks = seq(yscale_min,yscale_max,step)) +
+  theme_classic() +
+  theme(plot.title = element_text(size = 20, face = "bold"),
+        plot.subtitle = element_text(size = 16, face = "bold"),
+        axis.title = element_text(size = 14),
+        axis.text = element_text(size = 12),
+        legend.position = "none",
+        panel.grid.major.y = element_line(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(fill = "white"),
+        plot.margin = margin(0, 0, 0, 1, "cm"))
+
+yscale_max = 1.2
+yscale_min =-1.8
+step = 0.4
+
+figure_a15d = ggplot(dat_a15, aes(x = hour)) +
+  geom_point(aes(y = beta_solar_fall),color = "grey", size = 3) +
+  geom_errorbar(aes(ymax = beta_solar_fall+2*beta_solar_std_fall, ymin = beta_solar_fall-2*beta_solar_std_fall), size = 0.5) +
+  geom_hline(yintercept = 0, color = "black", size = 1.2, linetype = "solid")+
+  labs(x = "Hour", y = expression(paste("Change in Prices ($/MWh)"))) +
+  scale_x_continuous(limits = c(1,24), breaks = 1:24) +
+  scale_y_continuous(limits = c(yscale_min,yscale_max), breaks = seq(yscale_min,yscale_max,step)) +
+  theme_classic() +
+  theme(plot.title = element_text(size = 20, face = "bold"),
+        plot.subtitle = element_text(size = 16, face = "bold"),
+        axis.title = element_text(size = 14),
+        axis.text = element_text(size = 12),
+        legend.position = "none",
+        panel.grid.major.y = element_line(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(fill = "white"),
+        plot.margin = margin(0, 0, 0, 1, "cm"))
+
+
+figure_a15a
+figure_a15b
+figure_a15c
+figure_a15d
+
+
+```
+
+figure a16 
+```{r}
+yscale_max = 0.6
+yscale_min =-0.6
+step = 0.2
+
+figure_a16a = ggplot(dat_a16, aes(x = hour)) +
+  geom_point(aes(y = beta_wind_winter),color = "grey", size = 3) +
+  geom_errorbar(aes(ymax = beta_wind_winter+2*beta_wind_std_winter, ymin = beta_wind_winter-2*beta_wind_std_winter), size = 0.5) +
+  geom_hline(yintercept = 0, color = "black", size = 1.2, linetype = "solid")+
+  labs(x = "Hour", y = expression(paste("Change in Prices ($/MWh)"))) +
+  scale_x_continuous(limits = c(1,24), breaks = 1:24) +
+  scale_y_continuous(limits = c(yscale_min,yscale_max), breaks = seq(yscale_min,yscale_max,step)) +
+  theme_classic() +
+  theme(plot.title = element_text(size = 20, face = "bold"),
+        plot.subtitle = element_text(size = 16, face = "bold"),
+        axis.title = element_text(size = 14),
+        axis.text = element_text(size = 12),
+        legend.position = "none",
+        panel.grid.major.y = element_line(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(fill = "white"),
+        plot.margin = margin(0, 0, 0, 1, "cm"))
+
+yscale_max = 0.2
+yscale_min =-0.8
+step = 0.2
+
+figure_a16b = ggplot(dat_a16, aes(x = hour)) +
+  geom_point(aes(y = beta_wind_spring),color = "grey", size = 3) +
+  geom_errorbar(aes(ymax = beta_wind_spring+2*beta_wind_std_spring, ymin = beta_wind_spring-2*beta_wind_std_spring), size = 0.5) +
+  geom_hline(yintercept = 0, color = "black", size = 1.2, linetype = "solid")+
+  labs(x = "Hour", y = expression(paste("Change in Prices ($/MWh)"))) +
+  scale_x_continuous(limits = c(1,24), breaks = 1:24) +
+  scale_y_continuous(limits = c(yscale_min,yscale_max), breaks = seq(yscale_min,yscale_max,step)) +
+  theme_classic() +
+  theme(plot.title = element_text(size = 20, face = "bold"),
+        plot.subtitle = element_text(size = 16, face = "bold"),
+        axis.title = element_text(size = 14),
+        axis.text = element_text(size = 12),
+        legend.position = "none",
+        panel.grid.major.y = element_line(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(fill = "white"),
+        plot.margin = margin(0, 0, 0, 1, "cm"))
+
+yscale_max = 0.4
+yscale_min =-1.6
+step = 0.4
+
+figure_a16c = ggplot(dat_a16, aes(x = hour)) +
+  geom_point(aes(y = beta_wind_summer),color = "grey", size = 3) +
+  geom_errorbar(aes(ymax = beta_wind_summer+2*beta_wind_std_summer, ymin = beta_wind_summer-2*beta_wind_std_summer), size = 0.5) +
+  geom_hline(yintercept = 0, color = "black", size = 1.2, linetype = "solid")+
+  labs(x = "Hour", y = expression(paste("Change in Prices ($/MWh)"))) +
+  scale_x_continuous(limits = c(1,24), breaks = 1:24) +
+  scale_y_continuous(limits = c(yscale_min,yscale_max), breaks = seq(yscale_min,yscale_max,step)) +
+  theme_classic() +
+  theme(plot.title = element_text(size = 20, face = "bold"),
+        plot.subtitle = element_text(size = 16, face = "bold"),
+        axis.title = element_text(size = 14),
+        axis.text = element_text(size = 12),
+        legend.position = "none",
+        panel.grid.major.y = element_line(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(fill = "white"),
+        plot.margin = margin(0, 0, 0, 1, "cm"))
+
+yscale_max = 0.4
+yscale_min =-0.6
+step = 0.2
+
+figure_a16d = ggplot(dat_a16, aes(x = hour)) +
+  geom_point(aes(y = beta_wind_fall),color = "grey", size = 3) +
+  geom_errorbar(aes(ymax = beta_wind_fall+2*beta_wind_std_fall, ymin = beta_wind_fall-2*beta_wind_std_fall), size = 0.5) +
+  geom_hline(yintercept = 0, color = "black", size = 1.2, linetype = "solid")+
+  labs(x = "Hour", y = expression(paste("Change in Prices ($/MWh)"))) +
+  scale_x_continuous(limits = c(1,24), breaks = 1:24) +
+  scale_y_continuous(limits = c(yscale_min,yscale_max), breaks = seq(yscale_min,yscale_max,step)) +
+  theme_classic() +
+  theme(plot.title = element_text(size = 20, face = "bold"),
+        plot.subtitle = element_text(size = 16, face = "bold"),
+        axis.title = element_text(size = 14),
+        axis.text = element_text(size = 12),
+        legend.position = "none",
+        panel.grid.major.y = element_line(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(fill = "white"),
+        plot.margin = margin(0, 0, 0, 1, "cm"))
+
+
+figure_a16a
+figure_a16b
+figure_a16c
+figure_a16d
+
+
+```
+
+```{r}
+
+#eventuell zuerts nach solar sample splitten und seperat berechnen
+
+dat_density = dat_all_2016
+
+dat_density$p = seq_along(dat_density$rtm_hat) - 6
+dat_density$p[dat_density$p > 110] = NA
+
+
+density_estimation_actual = density(filter(dat_density, solar_sample == "actual")$rtm_hat, kernel = "epanechnikov" ,na.rm = TRUE , n = 110)
+
+dat_density$dist_actual = approx(density_estimation_actual$x, density_estimation_actual$y, xout = dat_density$p)$y
+
+
+density_estimation_2k = density(filter(dat_density, solar_sample == "solar_2k")$rtm_hat, kernel = "epanechnikov" ,na.rm = TRUE , n = 110)
+
+dat_density$dist_2k = approx(density_estimation_2k$x, density_estimation_2k$y, xout = dat_density$p)$y
+
+
+density_estimation_6k = density(filter(dat_density, solar_sample == "solar_6k")$rtm_hat, kernel = "epanechnikov" ,na.rm = TRUE , n = 110)
+
+dat_density$dist_6k = approx(density_estimation_6k$x, density_estimation_6k$y, xout = dat_density$p)$y
+
+
+density_estimation_10k = density(filter(dat_density, solar_sample == "solar_10k")$rtm_hat, kernel = "epanechnikov" ,na.rm = TRUE , n = 110)
+
+dat_density$dist_10k = approx(density_estimation_10k$x, density_estimation_10k$y, xout = dat_density$p)$y
+
+distribution_solar = data.frame(
+  "p" = -5:110,
+  "density:rtm_actual" = dat_density$dist_actual[1:116],
+  "density:rtm_2k" = dat_density$dist_2k[1:116],
+  "density:rtm_6k" = dat_density$dist_6k[1:116],
+  "density:rtm_10k" = dat_density$dist_10k[1:116]
+)
+
+distribution_solar
+```
+
+
+```{r}
+
+#eventuell zuerts nach solar sample splitten und seperat berechnen
+s = 2
+
+dat_density = dat_all_2016
+
+dat_density_2k = filter(dat_density, solar_sample == "solar_2k" & season == s)
+
+dat_density_2k$p = seq_along(dat_density_2k$rtm_hat) - 6
+dat_density_2k$p[dat_density_2k$p > 110] = NA
+
+density_estimation_2k = density(filter(dat_density_2k, solar_sample == "solar_2k")$rtm_hat, kernel = "epanechnikov" ,na.rm = TRUE , n = 110)
+
+dat_density_2k$dist2k = approx(density_estimation_2k$x, density_estimation_2k$y, xout = dat_density_2k$p)$y
+
+
+dat_density_10k = filter(dat_density, solar_sample == "solar_10k" & season == s)
+
+dat_density_10k$p = seq_along(dat_density_10k$rtm_hat) - 6
+dat_density_10k$p[dat_density_10k$p > 110] = NA
+
+density_estimation_10k = density(filter(dat_density_10k, solar_sample == "solar_10k")$rtm_hat, kernel = "epanechnikov" ,na.rm = TRUE , n = 110)
+
+dat_density_10k$dist10k = approx(density_estimation_10k$x, density_estimation_10k$y, xout = dat_density_10k$p)$y
+
+dist_solar_plot_2k = dat_density_2k %>% 
+  filter(!is.na(p) & season == s) %>% 
+  mutate(dist_cum = cumsum(dist2k))
+
+dist_solar_plot_10k = dat_density_10k %>% 
+  filter(!is.na(p) & season == s) %>% 
+  mutate(dist_cum = cumsum(dist10k))
+
+linesize = 0.5
+color = c("blue","red","green","black")
+yscale_max = 1
+yscale_min = 0
+step = 0.2
+
+
+
+figure_a18a =  ggplot() +
+  geom_line(data = dist_solar_plot_2k, aes(x = p, y = dist_cum),color = color[1], size = linesize)+
+  geom_line(data = dist_solar_plot_10k, aes(x = p, y = dist_cum ),color = color[2], size = linesize)+
+  geom_hline(yintercept = 0, color = "black", size = 1.2, linetype = "solid")+
+  labs(x = "p", y = expression(paste(""))) +
+  scale_x_continuous(limits = c(-10,70), breaks = seq(-10,70,20)) +
+  scale_y_continuous(limits = c(yscale_min,yscale_max), breaks = seq(yscale_min,yscale_max,step)) +
+  theme_classic() +
+  theme(plot.title = element_text(size = 20, face = "bold"),
+        plot.subtitle = element_text(size = 16, face = "bold"),
+        axis.title = element_text(size = 14),
+        axis.text = element_text(size = 12),
+        legend.position = "none",
+        panel.grid.major.y = element_line(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(fill = "white"),
+        plot.margin = margin(0, 0, 0, 1, "cm"))
+
+
+figure_a18a
+
+#keine ahnung stimmt noch nicht
+```
+
+
+```{r}
+dat_profit = dat_all_2016
+
+for (i in 0:100) {
+  dat_profit = mutate(dat_profit, !!paste("mc_", i, sep = "") := ifelse(rtm_hat >= i, 1, 0))
+  dat_profit = mutate(dat_profit, !!paste("pi_", i, sep = "") := ifelse(rtm_hat >= i, rtm_hat - i, 0))
+}
+
+
+dat_profit = dat_profit %>% 
+  group_by(solar_sample) %>%
+  summarise(across(starts_with(c("mc_", "pi_")), sum, na.rm = TRUE))
+
+operate = as.matrix(dat_profit %>% select(starts_with("mc_")))
+profit = as.matrix(dat_profit %>% select(starts_with("pi_")))
+
+profit = t(profit)
+operate = t(operate)
+
+
+profit_solar = data.frame(mc = 0:100, as.data.frame(operate), as.data.frame(profit))
+colnames(profit_solar) = c("mc", "operate_actual", "operate_10k", "operate_2k", "operate_6k", "profit_actual", "profit_10k", "profit_2k", "profit_6k")
+
+profit_solar
+
+```
+
+figure 7
+```{r}
+profit_solar_plot = mutate(profit_solar,
+  change_profit_6k = (profit_6k-profit_2k)/profit_2k*100,
+  change_profit_10k = (profit_10k-profit_2k)/profit_2k*100)
+
+linesize = 0.5
+color = c("blue","red","green","black")
+yscale_max = 0
+yscale_min = -35
+step = 2
+
+figure_7 =  ggplot(profit_solar_plot, aes(x = mc)) +
+  geom_line(aes(y = change_profit_6k),color = color[1], size = linesize)+
+  geom_line(aes(y = change_profit_10k ),color = color[2], size = linesize)+
+  geom_hline(yintercept = 0, color = "black", size = 1.2, linetype = "solid")+
+  labs(x = "marginal costs", y = expression(paste(""))) +
+  scale_x_continuous(limits = c(0,51), breaks = seq(0,51,5)) +
+  scale_y_continuous(limits = c(yscale_min,yscale_max), breaks = seq(yscale_min,yscale_max,step)) +
+  theme_classic() +
+  theme(plot.title = element_text(size = 20, face = "bold"),
+        plot.subtitle = element_text(size = 16, face = "bold"),
+        axis.title = element_text(size = 14),
+        axis.text = element_text(size = 12),
+        legend.position = "none",
+        panel.grid.major.y = element_line(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(fill = "white"),
+        plot.margin = margin(0, 0, 0, 1, "cm"))
+
+
+figure_7
+
+#form stimmt, zahlen aber nicht
+```
+
+figurea19
+```{r}
+producing_solar_plot = mutate(profit_solar,
+  change_producing_6k = (operate_6k-operate_2k)/operate_2k*100,
+  change_producing_10k = (operate_10k-operate_2k)/operate_2k*100)
+
+linesize = 0.5
+color = c("blue","red","green","black")
+yscale_max = 5
+yscale_min = -60 #sollte eig 45 sein
+step = 10
+
+figure_a19 =  ggplot(producing_solar_plot, aes(x = mc)) +
+  geom_line(aes(y = change_producing_6k),color = color[1], size = linesize)+
+  geom_line(aes(y = change_producing_10k ),color = color[2], size = linesize)+
+  geom_hline(yintercept = 0, color = "black", size = 1.2, linetype = "solid")+
+  labs(x = "marginal costs", y = expression(paste(""))) +
+  scale_x_continuous(limits = c(0,70), breaks = seq(0,70,5)) +
+  scale_y_continuous(limits = c(yscale_min,yscale_max), breaks = seq(yscale_min,yscale_max,step)) +
+  theme_classic() +
+  theme(plot.title = element_text(size = 20, face = "bold"),
+        plot.subtitle = element_text(size = 16, face = "bold"),
+        axis.title = element_text(size = 14),
+        axis.text = element_text(size = 12),
+        legend.position = "none",
+        panel.grid.major.y = element_line(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(fill = "white"),
+        plot.margin = margin(0, 0, 0, 1, "cm"))
+
+
+figure_a19
+
+#form stimmt aber zahl nicht
+```
+
+
+```{r}
+dat_actual = dat
+dat_actual$wind_sample = "actual"
+
+dat_1k = dat
+dat_1k$wind_potential = dat$wind_cap_factor * 1000 * (24 / 1000)
+dat_1k$wind_sample = "wind_1k"
+
+dat_3k = dat
+dat_3k$wind_potential = dat$wind_cap_factor * 3000 * (24 / 1000)
+dat_3k$wind_sample = "wind_3k"
+
+dat_6k = dat
+dat_6k$wind_potential = dat$wind_cap_factor * 6000 * (24 / 1000)
+dat_6k$wind_sample = "wind_6k"
+
+dat_all = rbind(dat_actual, dat_1k, dat_3k, dat_6k)
+
+dat_all$wind_load = dat_all$wind_potential * dat_all$daily_load
+
+formel_m = paste("m_", 1:11, sep = "", collapse = " + ")
+formel = formula(paste("wind_curtailed ~ daily_solar + wind_load + wind_potential + spot + daily_load + inches_lag +", formel_m))
+
+fit = tobit(formel, left = 0, data = filter(dat_all, hour == 12 & wind_sample == "actual"))
+
+dat_all$wind_curtailed_fitted = NA
+dat_all$wind_curtailed_fitted = predict(fit, newdata = dat_all)
+dat_all$wind_curtailed_fitted[dat_all$wind_curtailed_fitted < 0] = 0
+
+dat_all = mutate(dat_all, daily_wind = ifelse(wind_sample != "actual", wind_potential - wind_curtailed_fitted, daily_wind))
+
+for (h in 1:24) {
+ dat_all = mutate(dat_all, !!paste("daily_wind_h", toString(h), sep = "") := case_when(
+   (hour == h) ~ daily_wind,
+   .default = 0
+ ))
+}
+
+#Predict Prices
+
+formel_solar = paste("daily_solar_h", 1:24, sep = "", collapse = " + ")
+formel_wind = paste("daily_wind_h", 1:24, sep = "", collapse = " + ")
+formel_spot = paste("spot_h", 1:24, sep = "", collapse = " + ")
+formel_inches_lag = paste("inches_lag_h", 1:24, sep = "", collapse = " + ")
+formel_load = paste("load_h", 1:24, sep = "", collapse = " + ")
+formel_hour = paste("h_", 1:24, sep = "", collapse = " + ")
+
+formel_rhs = paste(formel_solar,formel_wind,formel_spot,formel_inches_lag,formel_load, formel_hour,"inches_lag_h1", sep = " + ")
+formel = paste("rtm_total_lmp ~ ", formel_rhs)
+
+dat_all <- dat_all %>%
+  mutate(rtm_fitted = NA,
+         resid = NA)
+
+for (s in 1:4) {
+  
+  fit = lm(formel,data = filter(dat_all, wind_sample == "actual" & season == s )) 
+  
+  dat_all[dat_all$season == s,]$rtm_fitted = predict(fit, newdata = filter(dat_all, season == s))
+  #Warnungen zu rank-deficient fit (ich glaub wegen hour, versuche mit as factor hour)
+  dat_all[dat_all$season == s & dat_all$wind_sample == "actual" & !is.na(dat_all$rtm_total_lmp),]$resid = residuals(fit)
+  
+}
+
+dat_all[dat_all$wind_sample == "wind_1k",]$resid = dat_all[dat_all$wind_sample == "actual",]$resid
+dat_all[dat_all$wind_sample == "wind_3k",]$resid = dat_all[dat_all$wind_sample == "actual",]$resid
+dat_all[dat_all$wind_sample == "wind_6k",]$resid = dat_all[dat_all$wind_sample == "actual",]$resid
+
+dat_all_2016 = dat_all %>%
+  mutate(rtm_hat = rtm_fitted + resid) %>%
+  filter(year == 2016)
+
+formel = paste("rtm_hat ~ ", formel_hour, "+ 0")
+beta_actual = coef(lm(formel, data = filter(dat_all_2016, wind_sample == "actual")))
+beta_1k = coef(lm(formel, data = filter(dat_all_2016, wind_sample == "wind_1k")))
+beta_3k = coef(lm(formel, data = filter(dat_all_2016, wind_sample == "wind_3k")))
+beta_6k = coef(lm(formel, data = filter(dat_all_2016, wind_sample == "wind_6k")))
+
+avg_price_wind <- data.frame(
+  hour = 1:24,
+  actual = beta_actual,
+  wind_1k = beta_1k,
+  wind_3k = beta_3k,
+  wind_6k = beta_6k)
+
+rownames(avg_price_wind) = NULL
+
+avg_price_wind
+
+#Actual passt rest leicht nicht liegts an den residuals?? NÖ
+
+```
+
+
+bottom panel of figure 6 and A7
+```{r}
+dotsize = 2
+linesize = 0.5
+color = c("blue","red","green","black")
+yscale_max = 70
+yscale_min = 0
+step = 10
+
+figure_a7 =  ggplot(avg_price_wind, aes(x = hour)) +
+  geom_point(aes(y = actual),color = color[1], size = dotsize) +
+  geom_line(aes(y = actual),color = color[1], size = linesize)+
+  geom_point(aes(y = wind_1k ),color = color[2], size = dotsize) +
+  geom_line(aes(y = wind_1k ),color = color[2], size = linesize)+
+  geom_point(aes(y = wind_3k ),color = color[3], size = dotsize) +
+  geom_line(aes(y = wind_3k ),color = color[3], size = linesize)+
+  geom_point(aes(y = wind_6k),color = color[4], size = dotsize) +
+  geom_line(aes(y = wind_6k),color = color[4], size = linesize)+
+  geom_hline(yintercept = 0, color = "black", size = 1.2, linetype = "solid")+
+  labs(x = "Hour", y = expression(paste("Avg. Change in Hourly Generation (MWh)"))) +
+  scale_x_continuous(limits = c(1,24), breaks = 1:24) +
+  scale_y_continuous(limits = c(yscale_min,yscale_max), breaks = seq(yscale_min,yscale_max,step)) +
+  theme_classic() +
+  theme(plot.title = element_text(size = 20, face = "bold"),
+        plot.subtitle = element_text(size = 16, face = "bold"),
+        axis.title = element_text(size = 14),
+        axis.text = element_text(size = 12),
+        legend.position = "none",
+        panel.grid.major.y = element_line(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(fill = "white"),
+        plot.margin = margin(0, 0, 0, 1, "cm"))
+
+
+figure_a7
+```
+
+
+
+```{r}
+
+dat_profit = dat_all_2016
+
+for (i in 0:100) {
+  dat_profit = mutate(dat_profit, !!paste("mc_", i, sep = "") := ifelse(rtm_hat >= i, 1, 0))
+  dat_profit = mutate(dat_profit, !!paste("pi_", i, sep = "") := ifelse(rtm_hat >= i, rtm_hat - i, 0))
+}
+
+
+dat_profit = dat_profit %>% 
+  group_by(wind_sample) %>%
+  summarise(across(starts_with(c("mc_", "pi_")), sum, na.rm = TRUE))
+
+operate = as.matrix(dat_profit %>% select(starts_with("mc_")))
+profit = as.matrix(dat_profit %>% select(starts_with("pi_")))
+
+profit = t(profit)
+operate = t(operate)
+
+
+profit_wind = data.frame(mc = 0:100, as.data.frame(operate), as.data.frame(profit))
+colnames(profit_wind) = c("mc", "operate_actual", "operate_1k", "operate_3k", "operate_6k", "profit_actual", "profit_1k", "profit_3k", "profit_6k")
+
+profit_wind
+```
+
+
+figure 7b
+```{r}
+profit_wind_plot = mutate(profit_wind,
+  change_profit_3k = (profit_3k-profit_1k)/profit_1k*100,
+  change_profit_6k = (profit_6k-profit_1k)/profit_1k*100)
+
+linesize = 0.5
+color = c("blue","red","green","black")
+yscale_max = 0
+yscale_min = -35
+step = 5
+
+figure_7b =  ggplot(profit_wind_plot, aes(x = mc)) +
+  geom_line(aes(y = change_profit_3k),color = color[1], linewidth = linesize)+
+  geom_line(aes(y = change_profit_6k ),color = color[2], linewidth = linesize)+
+  geom_hline(yintercept = 0, color = "black", linewidth = 1.2, linetype = "solid")+
+  labs(x = "marginal costs", y = expression(paste(""))) +
+  scale_x_continuous(limits = c(0,51), breaks = seq(0,51,5)) +
+  scale_y_continuous(limits = c(yscale_min,yscale_max), breaks = seq(yscale_min,yscale_max,step)) +
+  theme_classic() +
+  theme(plot.title = element_text(size = 20, face = "bold"),
+        plot.subtitle = element_text(size = 16, face = "bold"),
+        axis.title = element_text(size = 14),
+        axis.text = element_text(size = 12),
+        legend.position = "none",
+        panel.grid.major.y = element_line(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(fill = "white"),
+        plot.margin = margin(0, 0, 0, 1, "cm"))
+
+
+figure_7b
+
+#passt
+```
+
+figurea19
+```{r}
+producing_wind_plot = mutate(profit_wind,
+  change_producing_3k = (operate_3k-operate_1k)/operate_1k*100,
+  change_producing_6k = (operate_6k-operate_1k)/operate_1k*100)
+
+linesize = 0.5
+color = c("blue","red","green","black")
+yscale_max = 5
+yscale_min = -60 #sollte eig 40 sein
+step = 10
+
+figure_a19b =  ggplot(producing_wind_plot, aes(x = mc)) +
+  geom_line(aes(y = change_producing_3k),color = color[1], size = linesize)+
+  geom_line(aes(y = change_producing_6k ),color = color[2], size = linesize)+
+  geom_hline(yintercept = 0, color = "black", size = 1.2, linetype = "solid")+
+  labs(x = "marginal costs", y = expression(paste(""))) +
+  scale_x_continuous(limits = c(0,70), breaks = seq(0,70,5)) +
+  scale_y_continuous(limits = c(yscale_min,yscale_max), breaks = seq(yscale_min,yscale_max,step)) +
+  theme_classic() +
+  theme(plot.title = element_text(size = 20, face = "bold"),
+        plot.subtitle = element_text(size = 16, face = "bold"),
+        axis.title = element_text(size = 14),
+        axis.text = element_text(size = 12),
+        legend.position = "none",
+        panel.grid.major.y = element_line(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(fill = "white"),
+        plot.margin = margin(0, 0, 0, 1, "cm"))
+
+
+figure_a19b
+
+#form stimmt aber zahl nicht
+```
+
+
+The following section predicts counterfactual 2016 RTM prices for different levels of installed solar
+** capacity imposing the assumption that curtailment levels do not vary with renewable capacity.
+** The comparison of the counterfactual prices with and without endogenous curtailment is displayed in
+** in the top panel of Figure A8.
+
+
+```{r}
+dat_actual = dat
+dat_actual$solar_sample = "actual"
+
+dat_2k = dat
+dat_2k$solar_potential = dat$solar_cap_factor * 2000 * (24 / 1000)
+dat_2k$solar_sample = "solar_2k"
+
+dat_6k = dat
+dat_6k$solar_potential = dat$solar_cap_factor * 6000 * (24 / 1000)
+dat_6k$solar_sample = "solar_6k"
+
+dat_10k = dat
+dat_10k$solar_potential = dat$solar_cap_factor * 10000 * (24 / 1000)
+dat_10k$solar_sample = "solar_10k"
+
+dat_all = rbind(dat_actual, dat_2k, dat_6k, dat_10k)
+
+dat_all$test =  dat_all$solar_potential - dat_all$solar_curtailed
+
+dat_all = mutate(dat_all, daily_solar = ifelse(solar_sample != "actual", solar_potential - solar_curtailed, daily_solar))
+
+
+for (h in 1:24) {
+ dat_all = mutate(dat_all, !!paste("daily_solar_h", toString(h), sep = "") := case_when(
+   (hour == h) ~ daily_solar,
+   .default = 0
+ ))
+}
+
+formel_solar = paste("daily_solar_h", 1:24, sep = "", collapse = " + ")
+formel_wind = paste("daily_wind_h", 1:24, sep = "", collapse = " + ")
+formel_spot = paste("spot_h", 1:24, sep = "", collapse = " + ")
+formel_inches_lag = paste("inches_lag_h", 1:24, sep = "", collapse = " + ")
+formel_load = paste("load_h", 1:24, sep = "", collapse = " + ")
+formel_hour = paste("h_", 1:24, sep = "", collapse = " + ")
+
+formel_rhs = paste(formel_solar,formel_wind,formel_spot,formel_inches_lag,formel_load,formel_hour, sep = " + ")
+formel = paste("rtm_total_lmp ~ ", formel_rhs)
+
+dat_all <- dat_all %>%
+  mutate(rtm_fitted = NA,
+         resid = NA)
+
+for (s in 1:4) {
+  fit = lm(formel,data = filter(dat_all, solar_sample == "actual" & season == s))
+  
+  dat_all[dat_all$season == s,]$rtm_fitted = predict(fit, newdata = filter(dat_all, season == s))
+  dat_all[dat_all$season == s & dat_all$solar_sample == "actual" & !is.na(dat_all$rtm_total_lmp),]$resid = residuals(fit)
+  
+}
+
+dat_all[dat_all$solar_sample == "solar_2k",]$resid = dat_all[dat_all$solar_sample == "actual",]$resid
+dat_all[dat_all$solar_sample == "solar_6k",]$resid = dat_all[dat_all$solar_sample == "actual",]$resid
+dat_all[dat_all$solar_sample == "solar_10k",]$resid = dat_all[dat_all$solar_sample == "actual",]$resid
+
+dat_all_2016 = dat_all %>%
+  mutate(rtm_hat = rtm_fitted + resid) %>%
+  filter(year == 2016)
+
+formel = formula(paste("rtm_hat ~ ",formel_hour, "+ 0"))
+beta_actual = coef(lm(formel, data = filter(dat_all_2016, solar_sample == "actual" )))
+beta_2k = coef(lm(formel, data = filter(dat_all_2016, solar_sample == "solar_2k")))
+beta_6k = coef(lm(formel, data = filter(dat_all_2016, solar_sample == "solar_6k" )))
+beta_10k = coef(lm(formel, data = filter(dat_all_2016, solar_sample == "solar_10k" )))
+
+avg_price_solar_fixed = data.frame(
+  hour = 1:24,
+  actual = beta_actual,
+  solar_2k = beta_2k,
+  solar_6k = beta_6k,
+  solar_10k = beta_10k)
+
+rownames(avg_price_solar_fixed) = NULL
+
+avg_price_solar_fixed
+
+
+```
+
+
+figure a8
+```{r}
+
+curtailment_solar_plot = data.frame(hour = 1:24, 
+                                    solar_2k_diff = -1*(avg_price_solar$solar_2k - avg_price_solar_fixed$solar_2k),
+                                    solar_6k_diff = -1*(avg_price_solar$solar_6k - avg_price_solar_fixed$solar_6k),
+                                    solar_10k_diff = -1*(avg_price_solar$solar_10k - avg_price_solar_fixed$solar_10k),
+                                    solar_2k_rel = -100*(avg_price_solar$solar_2k - avg_price_solar_fixed$solar_2k) / avg_price_solar$solar_2k,
+                                    solar_6k_rel = -100*(avg_price_solar$solar_6k - avg_price_solar_fixed$solar_6k) / avg_price_solar$solar_6k,
+                                    solar_10k_rel = -100*(avg_price_solar$solar_10k - avg_price_solar_fixed$solar_10k) / avg_price_solar$solar_10k)
+
+
+linesize = 0.5
+color = c("blue","red","green","black")
+yscale_max = 0.46 # eigentlich 0.3
+yscale_min = -0.5 
+step = 0.2
+
+figure_a8a =  ggplot(curtailment_solar_plot, aes(x = hour)) +
+  geom_line(aes(y = solar_2k_diff),color = color[1], size = linesize)+
+  geom_line(aes(y = solar_6k_diff ),color = color[2], size = linesize)+
+  geom_line(aes(y = solar_10k_diff ),color = color[3], size = linesize)+
+  geom_hline(yintercept = 0, color = "black", size = 1.2, linetype = "solid")+
+  labs(x = "Hour", y = expression(paste(""))) +
+  scale_x_continuous(limits = c(1,24), breaks = seq(1,24,1)) +
+  scale_y_continuous(limits = c(yscale_min,yscale_max), breaks = seq(yscale_min,yscale_max,step)) +
+  theme_classic() +
+  theme(plot.title = element_text(size = 20, face = "bold"),
+        plot.subtitle = element_text(size = 16, face = "bold"),
+        axis.title = element_text(size = 14),
+        axis.text = element_text(size = 12),
+        legend.position = "none",
+        panel.grid.major.y = element_line(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(fill = "white"),
+        plot.margin = margin(0, 0, 0, 1, "cm"))
+
+linesize = 0.5
+color = c("blue","red","green","black")
+yscale_max = 1 # eigentlich 0.3
+yscale_min = -3 
+step = 1
+
+figure_a8b =  ggplot(curtailment_solar_plot, aes(x = hour)) +
+  geom_line(aes(y = solar_2k_rel),color = color[1], size = linesize)+
+  geom_line(aes(y = solar_6k_rel ),color = color[2], size = linesize)+
+  geom_line(aes(y = solar_10k_rel ),color = color[3], size = linesize)+
+  geom_hline(yintercept = 0, color = "black", size = 1.2, linetype = "solid")+
+  labs(x = "Hour", y = expression(paste(""))) +
+  scale_x_continuous(limits = c(1,24), breaks = seq(1,24,1)) +
+  scale_y_continuous(limits = c(yscale_min,yscale_max), breaks = seq(yscale_min,yscale_max,step)) +
+  theme_classic() +
+  theme(plot.title = element_text(size = 20, face = "bold"),
+        plot.subtitle = element_text(size = 16, face = "bold"),
+        axis.title = element_text(size = 14),
+        axis.text = element_text(size = 12),
+        legend.position = "none",
+        panel.grid.major.y = element_line(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(fill = "white"),
+        plot.margin = margin(0, 0, 0, 1, "cm"))
+
+
+figure_a8a
+figure_a8b
+
+#form aber zahlen nicht
+
+```
+
+
+
+** The following section predicts counterfactual 2016 RTM prices for different levels of installed wind
+** capacity imposing the assumption that curtailment levels do not vary with renewable capacity.
+** The comparison of the counterfactual prices with and without endogenous curtailment is displayed in
+** in the bottom panel of Figure A8.
+
+
+```{r}
+dat_actual = dat
+dat_actual$wind_sample = "actual"
+
+dat_1k = dat
+dat_1k$wind_potential = dat$wind_cap_factor * 1000 * (24 / 1000)
+dat_1k$wind_sample = "wind_1k"
+
+dat_3k = dat
+dat_3k$wind_potential = dat$wind_cap_factor * 3000 * (24 / 1000)
+dat_3k$wind_sample = "wind_3k"
+
+dat_6k = dat
+dat_6k$wind_potential = dat$wind_cap_factor * 6000 * (24 / 1000)
+dat_6k$wind_sample = "wind_6k"
+
+dat_all = rbind(dat_actual, dat_1k, dat_3k, dat_6k)
+
+dat_all$wind_load = dat_all$wind_potential * dat_all$daily_load
+
+dat_all = mutate(dat_all, daily_wind = ifelse(wind_sample != "actual", wind_potential - wind_curtailed, daily_wind))
+
+for (h in 1:24) {
+ dat_all = mutate(dat_all, !!paste("daily_wind_h", toString(h), sep = "") := case_when(
+   (hour == h) ~ daily_wind,
+   .default = 0
+ ))
+}
+
+
+#Predict Prices
+
+formel_solar = paste("daily_solar_h", 1:24, sep = "", collapse = " + ")
+formel_wind = paste("daily_wind_h", 1:24, sep = "", collapse = " + ")
+formel_spot = paste("spot_h", 1:24, sep = "", collapse = " + ")
+formel_inches_lag = paste("inches_lag_h", 1:24, sep = "", collapse = " + ")
+formel_load = paste("load_h", 1:24, sep = "", collapse = " + ")
+formel_hour = paste("h_", 1:24, sep = "", collapse = " + ")
+
+formel_rhs = paste(formel_solar,formel_wind,formel_spot,formel_inches_lag,formel_load,formel_hour, sep = " + ")
+formel = paste("rtm_total_lmp ~ ", formel_rhs)
+
+dat_all <- dat_all %>%
+  mutate(rtm_fitted = NA,
+         resid = NA)
+
+for (s in 1:4) {
+  
+  fit = lm(formel,data = filter(dat_all, wind_sample == "actual" & season == s)) 
+  
+  dat_all[dat_all$season == s,]$rtm_fitted = predict(fit, newdata = filter(dat_all, season == s))
+  dat_all[dat_all$season == s & dat_all$wind_sample == "actual" & !is.na(dat_all$rtm_total_lmp),]$resid = residuals(fit)
+  
+}
+
+dat_all[dat_all$wind_sample == "wind_1k",]$resid = dat_all[dat_all$wind_sample == "actual",]$resid
+dat_all[dat_all$wind_sample == "wind_3k",]$resid = dat_all[dat_all$wind_sample == "actual",]$resid
+dat_all[dat_all$wind_sample == "wind_6k",]$resid = dat_all[dat_all$wind_sample == "actual",]$resid
+
+dat_all_2016 = dat_all %>%
+  mutate(rtm_hat = rtm_fitted + resid) %>%
+  filter(year == 2016)
+
+formel = formula(paste("rtm_hat ~ ",formel_hour, "+ 0"))
+beta_actual = coef(lm(formel, data = filter(dat_all_2016, wind_sample == "actual")))
+beta_1k = coef(lm(formel, data = filter(dat_all_2016, wind_sample == "wind_1k")))
+beta_3k = coef(lm(formel, data = filter(dat_all_2016, wind_sample == "wind_3k")))
+beta_6k = coef(lm(formel, data = filter(dat_all_2016, wind_sample == "wind_6k")))
+
+avg_price_wind_fixed = data.frame(
+  hour = 1:24,
+  actual = beta_actual,
+  wind_1k = beta_1k,
+  wind_3k = beta_3k,
+  wind_6k = beta_6k)
+
+rownames(avg_price_wind_fixed) = NULL
+
+avg_price_wind_fixed
+```
+
+figure f
+```{r}
+#
+#curtailment_wind_plot = data.frame(hour = 1:24, 
+#                                    wind_1k_diff = -1*(avg_price_wind$wind_1k - avg_price_wind_fixed$wind_1k),
+#                                    wind_3k_diff = -1*(avg_price_wind$wind_3k - avg_price_wind_fixed$wind_3k),
+#                                    wind_6k_diff = -1*(avg_price_wind$wind_6k - avg_price_wind_fixed$wind_6k),
+#                                    wind_1k_rel = -100*(avg_price_wind$wind_1k - avg_price_wind_fixed$wind_1k) / #avg_price_wind$wind_1k,
+#                                    wind_3k_rel = -100*(avg_price_wind$wind_3k - avg_price_wind_fixed$wind_3k) / #avg_price_wind$wind_3k,
+#                                    wind_6k_rel = -100*(avg_price_wind$wind_6k - avg_price_wind_fixed$wind_6k) / #avg_price_wind$wind_6k)
+#
+#
+#linesize = 0.5
+#color = c("blue","red","green","black")
+#yscale_max = 0 # eigentlich 0.3
+#yscale_min = -30 
+#step = 5
+#
+#figure_fa =  ggplot(curtailment_wind_plot, aes(x = hour)) +
+#  geom_line(aes(y = wind_1k_diff),color = color[1], size = linesize)+
+#  geom_line(aes(y = wind_3k_diff ),color = color[2], size = linesize)+
+#  geom_line(aes(y = wind_6k_diff ),color = color[3], size = linesize)+
+#  geom_hline(yintercept = 0, color = "black", size = 1.2, linetype = "solid")+
+#  labs(x = "Hour", y = expression(paste(""))) +
+#  scale_x_continuous(limits = c(1,24), breaks = seq(1,24,1)) +
+#  scale_y_continuous(limits = c(yscale_min,yscale_max), breaks = seq(yscale_min,yscale_max,step)) +
+#  theme_classic() +
+#  theme(plot.title = element_text(size = 20, face = "bold"),
+#        plot.subtitle = element_text(size = 16, face = "bold"),
+#        axis.title = element_text(size = 14),
+#        axis.text = element_text(size = 12),
+#        legend.position = "none",
+#        panel.grid.major.y = element_line(),
+#        panel.grid.minor = element_blank(),
+#        panel.background = element_rect(fill = "white"),
+#        plot.margin = margin(0, 0, 0, 1, "cm"))
+#
+#linesize = 0.5
+#color = c("blue","red","green","black")
+#yscale_max = 1 # eigentlich 0.3
+#yscale_min = -3 
+#step = 1
+#
+#figure_fb =  ggplot(curtailment_wind_plot, aes(x = hour)) +
+#  geom_line(aes(y = wind_1k_rel),color = color[1], size = linesize)+
+#  geom_line(aes(y = wind_3k_rel ),color = color[2], size = linesize)+
+#  geom_line(aes(y = wind_6k_rel ),color = color[3], size = linesize)+
+#  geom_hline(yintercept = 0, color = "black", size = 1.2, linetype = "solid")+
+#  labs(x = "Hour", y = expression(paste(""))) +
+#  scale_x_continuous(limits = c(1,24), breaks = seq(1,24,1)) +
+#  scale_y_continuous(limits = c(yscale_min,yscale_max), breaks = seq(yscale_min,yscale_max,step)) +
+#  theme_classic() +
+#  theme(plot.title = element_text(size = 20, face = "bold"),
+#        plot.subtitle = element_text(size = 16, face = "bold"),
+#        axis.title = element_text(size = 14),
+#        axis.text = element_text(size = 12),
+#        legend.position = "none",
+#        panel.grid.major.y = element_line(),
+#        panel.grid.minor = element_blank(),
+#        panel.background = element_rect(fill = "white"),
+#        plot.margin = margin(0, 0, 0, 1, "cm"))
+#
+#
+#figure_fa
+#figure_fb
+#
+#form aber zahlen nicht
+
+```
+
+
+** The following section predicts the marginal energy value (during 2016) from an additional MW of
+** solar capacity. The predicted changes in the market value of the additional solar output are
+** displayed in the top panel of Figure 8.
+
+```{r}
+dat_mar_solar = dat
+
+dat_mar_solar = dat_mar_solar %>% 
+  mutate(hourly_solar_cap_factor = solar/solar_cap,
+         hourly_wind_cap_factor = wind/wind_cap,
+         solar_sample = "actual",
+         sample_id = 0)
+
+dat_mar_solar_0 = dat_mar_solar
+
+for (i in seq(2000,10000,500)) {
+  temp = dat_mar_solar_0
+  temp = temp %>% 
+    mutate(solar_potential = solar_cap_factor * i * (24/1000),
+           sample_id = i,
+           solar_sample = paste("solar_",toString(i),sep = ""))
+  
+  dat_mar_solar = rbind(dat_mar_solar,temp)
+}
+
+dat_mar_solar$solar_load = dat_mar_solar$solar_potential * dat_mar_solar$daily_load
+
+
+formel = formula(solar_curtailed ~ solar_potential + solar_load + daily_wind + spot + daily_load + inches_lag + as.factor(month))
+
+fit = tobit(formel, left = 0, data = filter(dat_mar_solar, hour == 12 & solar_sample == "actual"))
+
+dat_mar_solar$solar_curtailed_fitted = NA
+dat_mar_solar$solar_curtailed_fitted = predict(fit, newdata = dat_mar_solar)
+dat_mar_solar$solar_curtailed_fitted[dat_mar_solar$solar_curtailed_fitted < 0] = 0
+
+dat_mar_solar = mutate(dat_mar_solar, daily_solar = ifelse(solar_sample != "actual", solar_potential - solar_curtailed_fitted, daily_solar))
+
+for (h in 1:24) {
+ dat_mar_solar = mutate(dat_mar_solar, !!paste("daily_solar_h", toString(h), sep = "") := case_when(
+   (hour == h) ~ daily_solar,
+   .default = 0
+ ))
+}
+
+#Predict Prices
+
+
+formel_solar = paste("daily_solar_h", 1:24, sep = "", collapse = " + ")
+formel_wind = paste("daily_wind_h", 1:24, sep = "", collapse = " + ")
+formel_spot = paste("spot_h", 1:24, sep = "", collapse = " + ")
+formel_inches_lag = paste("inches_lag_h", 1:24, sep = "", collapse = " + ")
+formel_load = paste("load_h", 1:24, sep = "", collapse = " + ")
+formel_m_h = paste(colnames(dat_mar_solar[,grep("^m[1-9][0-9]?_h[1-9][0-9]?$", colnames(dat_mar_solar))]), sep = "", collapse = " + ")
+
+formel_rhs = paste(formel_solar,formel_wind,formel_spot,formel_inches_lag,formel_load,formel_m_h, sep = " + ")
+formel = paste("rtm_total_lmp ~ ", formel_rhs)
+
+dat_mar_solar <- dat_mar_solar %>%
+  mutate(rtm_fitted = NA,
+         resid = NA)
+  
+fit = lm(formel,data = filter(dat_mar_solar, solar_sample == "actual")) 
+
+dat_mar_solar$rtm_fitted = predict(fit, newdata = dat_mar_solar)
+dat_mar_solar[dat_mar_solar$solar_sample == "actual" & !is.na(dat_mar_solar$rtm_total_lmp),]$resid = residuals(fit)
+
+residu = dat_mar_solar[dat_mar_solar$solar_sample == "actual",]$resid
+  
+for (i in names(table(dat_mar_solar$solar_sample))) {
+  dat_mar_solar[dat_mar_solar$solar_sample == i,]$resid = residu
+}
+
+dat_mar_solar_2016 = dat_mar_solar %>%
+  mutate(rtm_hat = rtm_fitted + resid) %>%
+  filter(year == 2016)
+
+marginal_solar =  dat_mar_solar_2016 %>% 
+  mutate(marginal_revenue = rtm_hat * hourly_solar_cap_factor) %>%
+  group_by(sample_id) %>% 
+  summarise(marginal_revenue = sum(marginal_revenue, na.rm = TRUE)) %>% 
+  filter(sample_id != 0) %>% 
+  rename("solar_capacity" := "sample_id")
+
+marginal_solar
+
+
+```
+
+
+figure 8
+```{r}
+mar_sol_plot = mutate(marginal_solar, rel_change = 100*(marginal_revenue-max(marginal_revenue))/max(marginal_revenue))
+
+linesize = 0.5
+color = c("blue")
+yscale_max = 0
+yscale_min = -60
+step = 10
+
+figure_8a =  ggplot(mar_sol_plot, aes(x = solar_capacity )) +
+  geom_line(aes(y = rel_change),color = color[1], size = linesize)+
+  geom_hline(yintercept = 0, color = "black", size = 1.2, linetype = "solid")+
+  labs(x = "Counterfactual Solar Capacity (MW)", y = expression(paste("Change in Marginal Revenue"))) +
+  scale_x_continuous(limits = c(2000,10000), breaks = seq(2000,10000,1000)) +
+  scale_y_continuous(limits = c(yscale_min,yscale_max), breaks = seq(yscale_min,yscale_max,step)) +
+  theme_classic() +
+  theme(plot.title = element_text(size = 20, face = "bold"),
+        plot.subtitle = element_text(size = 16, face = "bold"),
+        axis.title = element_text(size = 14),
+        axis.text = element_text(size = 12),
+        legend.position = "none",
+        panel.grid.major.y = element_line(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(fill = "white"),
+        plot.margin = margin(0, 0, 0, 1, "cm"))
+
+
+figure_8a
+```
+
+
+
+** The following section predicts the marginal energy value (during 2016) from an additional MW of
+** wind capacity. The predicted changes in the market value of the additional solar output are
+** displayed in the bottom panel of Figure 8.
+
+
+
+```{r}
+dat_mar_wind = dat
+
+dat_mar_wind = dat_mar_wind %>% 
+  mutate(hourly_solar_cap_factor = solar/solar_cap,
+         hourly_wind_cap_factor = wind/wind_cap,
+         wind_sample = "actual",
+         sample_id = 0)
+
+dat_mar_wind_0 = dat_mar_wind
+
+for (i in seq(1000,6000,500)) {
+  temp = dat_mar_wind_0
+  temp = temp %>% 
+    mutate(wind_potential = wind_cap_factor * i * (24/1000),
+           sample_id = i,
+           wind_sample = paste("wind_",toString(i),sep = "")
+    )
+  dat_mar_wind = rbind(dat_mar_wind,temp)
+}
+
+dat_mar_wind$wind_load = dat_mar_wind$wind_potential * dat_mar_wind$daily_load
+
+formel = formula(wind_curtailed ~ daily_solar + wind_load + wind_potential + spot + daily_load + inches_lag + as.factor(month))
+fit = tobit(formel, left = 0, data = filter(dat_mar_wind, hour == 12 & wind_sample == "actual"))
+
+dat_mar_wind$wind_curtailed_fitted = NA
+dat_mar_wind$wind_curtailed_fitted = predict(fit, newdata = dat_mar_wind, type = "response")
+dat_mar_wind$wind_curtailed_fitted[dat_mar_wind$wind_curtailed_fitted < 0] = 0
+
+dat_mar_wind = mutate(dat_mar_wind, daily_wind = ifelse(wind_sample != "actual", wind_potential - wind_curtailed_fitted, daily_wind))
+
+for (h in 1:24) {
+ dat_mar_wind = mutate(dat_mar_wind, !!paste("daily_wind_h", toString(h), sep = "") := case_when(
+   (hour == h) ~ daily_wind,
+   .default = 0
+ ))
+}
+
+#Predict Prices
+
+
+formel_solar = paste("daily_solar_h", 1:24, sep = "", collapse = " + ")
+formel_wind = paste("daily_wind_h", 1:24, sep = "", collapse = " + ")
+formel_spot = paste("spot_h", 1:24, sep = "", collapse = " + ")
+formel_inches_lag = paste("inches_lag_h", 1:24, sep = "", collapse = " + ")
+formel_load = paste("load_h", 1:24, sep = "", collapse = " + ")
+formel_m_h = paste(colnames(dat_mar_wind[,grep("^m[1-9][0-9]?_h[1-9][0-9]?$", colnames(dat_mar_wind))]), sep = "", collapse = " + ")
+
+formel_rhs = paste(formel_solar,formel_wind,formel_spot,formel_inches_lag,formel_load,formel_m_h, sep = " + ")
+formel = paste("rtm_total_lmp ~ ", formel_rhs)
+
+dat_mar_wind <- dat_mar_wind %>%
+  mutate(rtm_fitted = NA,
+         resid = NA)
+  
+fit = lm(formel,data = filter(dat_mar_wind, wind_sample == "actual")) 
+
+dat_mar_wind$rtm_fitted = predict(fit, newdata = dat_mar_wind)
+dat_mar_wind[dat_mar_wind$wind_sample == "actual" & !is.na(dat_mar_wind$rtm_total_lmp),]$resid = residuals(fit)
+
+residu = dat_mar_wind[dat_mar_wind$wind_sample == "actual",]$resid
+  
+  
+for (i in names(table(dat_mar_wind$wind_sample))) {
+  dat_mar_wind[dat_mar_wind$wind_sample == i,]$resid = residu
+}
+
+
+
+dat_mar_wind_2016 = dat_mar_wind %>%
+  mutate(rtm_hat = rtm_fitted + resid) %>%
+  filter(year == 2016)
+
+marginal_wind =  dat_mar_wind_2016 %>% 
+  mutate(marginal_revenue = rtm_hat * hourly_wind_cap_factor) %>%
+  group_by(sample_id) %>% 
+  summarise(marginal_revenue = sum(marginal_revenue, na.rm = TRUE)) %>% 
+  filter(sample_id != 0) %>% 
+  rename("wind_capacity" := "sample_id")
+
+marginal_wind
+
+```
+
+
+figure 8
+```{r}
+mar_wind_plot = mutate(marginal_wind, rel_change = 100*(marginal_revenue-max(marginal_revenue))/max(marginal_revenue))
+
+linesize = 0.5
+color = c("blue")
+yscale_max = 0
+yscale_min = -25
+step = 5
+
+figure_8b =  ggplot(mar_wind_plot, aes(x = wind_capacity )) +
+  geom_line(aes(y = rel_change),color = color[1], size = linesize)+
+  geom_hline(yintercept = 0, color = "black", size = 1.2, linetype = "solid")+
+  labs(x = "Counterfactual Wind Capacity (MW)", y = expression(paste("Change in Marginal Revenue"))) +
+  scale_x_continuous(limits = c(1000,6000), breaks = seq(1000,6000,500)) +
+  scale_y_continuous(limits = c(yscale_min,yscale_max), breaks = seq(yscale_min,yscale_max,step)) +
+  theme_classic() +
+  theme(plot.title = element_text(size = 20, face = "bold"),
+        plot.subtitle = element_text(size = 16, face = "bold"),
+        axis.title = element_text(size = 14),
+        axis.text = element_text(size = 12),
+        legend.position = "none",
+        panel.grid.major.y = element_line(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(fill = "white"),
+        plot.margin = margin(0, 0, 0, 1, "cm"))
+
+
+figure_8b
+```
+
+
+
+
