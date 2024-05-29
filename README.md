@@ -17,7 +17,7 @@ install.packages("RTutor",repos = c("https://skranz-repo.github.io/drat/",getOpt
 if (!require(devtools))
   install.packages("devtools")
 
-devtools::install_github("ThomasReumiller/RTutorImpactOfRenewablesOnConventionalGeneration")
+devtools::install_github("ThomasReumiller/Impact_of_renewables_on_conventional_generation")
 ```
 
 ## 2. Show and work on the problem set
