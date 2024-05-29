@@ -1,0 +1,12 @@
+Package: RTutorImpactOfRenewablesOnConventionalGeneration
+Type: Package
+Title: RTutor problem set Impact_of_renewables_on_conventional_generation
+Version: 0.1
+Date: 2024-29-05
+Author: Thomas Reumiller
+Maintainer: Thomas Reumiller <tomreu17@gmail.com>
+Description: RTutor problem set Impact_of_renewables_on_conventional_generation
+License: Not yet licensed by the author. The default suggestion for licensing is
+	Problem set content: Creative Commons (CC BY-SA)
+	Package code: GPL >= 2.0
+Depends: RTutor, ggplot2, haven, dplyr, sandwich, AER, stats, stargazer, car, patchwork
